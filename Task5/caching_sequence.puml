@@ -1,0 +1,59 @@
+@startuml
+title Кеширование дашборда MES: чтение списка заказов и смена статуса
+
+skinparam responseMessageBelowArrow true
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 220
+
+actor "Оператор\n(MES SPA)" as Operator
+participant "MES API" as MESAPI
+participant "Redis\n(кеш списка заказов)" as Redis
+database "MES DB" as MESDB
+queue "RabbitMQ\n(MES → CRM)" as MQ
+
+== Чтение списка заказов (дашборд, первая страница) ==
+
+Operator -> MESAPI : GET /orders?status=IN_WORK\n(открыл дашборд)
+activate MESAPI
+MESAPI -> Redis : GET orders:in_work\n(ключ = статус + окно пагинации)
+activate Redis
+alt cache hit (данные свежие)
+    Redis --> MESAPI : список заказов (JSON)
+    MESAPI --> Operator : 200 OK, дашборд за ~10 мс
+else cache miss / TTL истёк
+    Redis --> MESAPI : null
+    MESAPI -> MESDB : SELECT заказов IN_WORK\n(сортировка по дате создания)
+    activate MESDB
+    MESDB --> MESAPI : список заказов
+    deactivate MESDB
+    MESAPI -> Redis : SET orders:in_work\n(TTL 60 c, прогрев)
+    MESAPI --> Operator : 200 OK, дашборд
+end
+deactivate Redis
+deactivate MESAPI
+
+== Смена статуса заказа (запись) ==
+
+Operator -> MESAPI : POST /orders/{id}/status\nMANUFACTURING_STARTED
+activate MESAPI
+MESAPI -> MESDB : UPDATE заказа + запись в аудит смены статуса
+activate MESDB
+MESDB --> MESAPI : OK
+deactivate MESDB
+MESAPI -> MQ : publish OrderStatusChanged\n(order_id, из/в, время)
+MQ --> MESAPI : (подтверждение публикации)
+MESAPI -> Redis : DEL orders:in_work\n(инвалидация по ключу — список стал неактуален)
+activate Redis
+Redis --> MESAPI : OK
+deactivate Redis
+MESAPI --> Operator : 200 OK
+deactivate MESAPI
+
+MQ -> "CRM (консьюмер)" : consume OrderStatusChanged
+note right of MQ
+  CRM обновляет свою копию заказа;
+  трейс/лог со сквозным order_id
+  (Task3, Task4)
+end note
+
+@enduml
